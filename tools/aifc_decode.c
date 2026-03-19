@@ -386,6 +386,7 @@ int main(int argc, char **argv)
 {
     s16 order = -1;
     s16 nloops = 0;
+    u32 vadpcmFlags = 0;
     ALADPCMloop *aloops = NULL;
     s16 npredictors = -1;
     s32 ***coefTable = NULL;
@@ -509,6 +510,9 @@ int main(int argc, char **argv)
                         if (nloops != 1) {
                             fail_parse("Only a single loop supported");
                         }
+                    } else if (strcmp("VADPCMFLAGS", ChunkName) == 0) {
+                        checked_fread(&vadpcmFlags, sizeof(u32), 1, ifile);
+                        BSWAP32(vadpcmFlags);
                     }
                 }
             }
@@ -562,7 +566,8 @@ int main(int argc, char **argv)
             do {
                 if (++iter > 1000000) {
                     printf("Failed to match frame %d after 1000000 attempts\n", currPos);
-                    break;
+                    exit(1);
+                    // break;
                 }
                 permute(guess, decoded, scale);
                 memcpy(state, lastState, sizeof(lastState));
@@ -656,6 +661,11 @@ int main(int argc, char **argv)
             }
         }
     }
+
+    write_header(ofile, "APPL", 4 + 12 + sizeof(vadpcmFlags));
+    fwrite("stoc", 4, 1, ofile);
+    fwrite("\x0bVADPCMFLAGS", 12, 1, ofile);
+    fwrite(&vadpcmFlags, sizeof(vadpcmFlags), 1, ofile);
 
     write_header(ofile, "SSND", outputBytes + 8);
     SndDChunk.offset = 0;

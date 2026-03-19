@@ -20,7 +20,7 @@ orderedJsonDecoder = JSONDecoder(object_pairs_hook=OrderedDict)
 
 
 class Aifc:
-    def __init__(self, name, fname, data, sample_rate, book, loop):
+    def __init__(self, name, fname, data, sample_rate, book, loop, flags):
         self.name = name
         self.fname = fname
         self.data = data
@@ -29,6 +29,7 @@ class Aifc:
         self.loop = loop
         self.used = False
         self.offset = None
+        self.flags = flags
 
 
 class SampleBank:
@@ -141,6 +142,7 @@ def parse_aifc(data, name, fname):
     audio_data = None
     vadpcm_codes = None
     vadpcm_loops = None
+    vadpcm_flags = 0
     sample_rate = None
 
     for (tp, data) in sections:
@@ -152,6 +154,8 @@ def parse_aifc(data, name, fname):
                 vadpcm_codes = data
             elif tp == b"VADPCMLOOPS":
                 vadpcm_loops = data
+            elif tp == b"VADPCMFLAGS":
+                vadpcm_flags = struct.unpack(">I", data[:4])[0]
         elif tp == b"SSND":
             audio_data = data[8:]
         elif tp == b"COMM":
@@ -163,7 +167,7 @@ def parse_aifc(data, name, fname):
 
     book = parse_aifc_book(vadpcm_codes)
     loop = parse_aifc_loop(vadpcm_loops) if vadpcm_loops is not None else None
-    return Aifc(name, fname, audio_data, sample_rate, book, loop)
+    return Aifc(name, fname, audio_data, sample_rate, book, loop, vadpcm_flags)
 
 
 class ReserveSerializer:
@@ -275,6 +279,7 @@ def validate_sound(json, sample_bank, forstr=""):
     validate_json_format(json, {"sample": str}, forstr)
     if "tuning" in json:
         validate_json_format(json, {"tuning": float}, forstr)
+
     validate(
         json["sample"] in sample_bank.name_to_entry,
         "reference to sound {} which isn't found in sample bank {}".format(
@@ -364,7 +369,8 @@ def validate_bank(json, sample_bank):
             instruments.append((name, inst))
             instrument_names.add(name)
 
-    for drum in drums:
+    drum_names = set()
+    for i, drum in enumerate(drums):
         validate(isinstance(drum, dict), "drum entry must be an object")
         validate_json_format(
             drum,
@@ -376,6 +382,7 @@ def validate_bank(json, sample_bank):
             "reference to non-existent envelope " + drum["envelope"],
             "drum",
         )
+        drum_names.add(f"drum{i}")
 
     no_sound = {}
 
@@ -448,23 +455,27 @@ def validate_bank(json, sample_bank):
         )
         seen_instruments.add(inst)
     
-    for inst in json["drum_list"]:
-        if inst is None:
+    seen_drums = set()
+    for drum in json["drum_list"]:
+        if drum is None:
             continue
         validate(
-            isinstance(inst, str),
+            isinstance(drum, str),
             "drum list should contain only strings and nulls",
         )
-        # validate(
-        #     inst in instrument_names, "reference to non-existent instrument " + inst
-        # )
-        # validate(
-        #     inst not in seen_instruments, inst + " occurs twice in the instrument list"
-        # )
-        # seen_instruments.add(inst)
+        validate(
+            drum in drum_names, "reference to non-existent instrument " + drum
+        )
+        validate(
+            drum not in seen_drums, drum + " occurs twice in the instrument list"
+        )
+        seen_drums.add(drum)
 
     for inst in instrument_names:
         validate(inst in seen_instruments, "unreferenced instrument " + inst)
+    
+    for drum in drum_names:
+        validate(drum in seen_drums, "unreferenced drum " + drum)
 
 
 def apply_ifs(json, defines):
@@ -564,7 +575,10 @@ def serialize_ctl(bank, base_ser, is_shindou):
                 used_samples.append(inst["sound_hi"]["sample"])
 
     sample_name_to_addr = {}
-    for name in used_samples:
+    book_to_addr = {}
+    # hack: looking for a better solution so this. They are only sorted in entry 0
+    samples = sorted(used_samples) if bank.name.startswith("00") else used_samples
+    for name in samples:
         if name in sample_name_to_addr:
             continue
         sample_name_to_addr[name] = ser.size
@@ -572,7 +586,10 @@ def serialize_ctl(bank, base_ser, is_shindou):
         sample_len = len(aifc.data)
 
         # Sample
-        ser.add(pack("IX", align(sample_len, 2) if is_shindou else 0))
+        if is_shindou:
+            ser.add(pack("IX", align(sample_len, 2)))
+        else:
+            ser.add(pack("I", aifc.flags))
         ser.add(pack("P", aifc.offset))
         loop_addr_buf = ser.reserve(WORD_BYTES)
         book_addr_buf = ser.reserve(WORD_BYTES)
@@ -581,10 +598,15 @@ def serialize_ctl(bank, base_ser, is_shindou):
         ser.align(16)
 
         # Book
-        book_addr_buf.append(pack("P", ser.size))
-        ser.add(pack("ii", aifc.book.order, aifc.book.npredictors))
+        book_data = pack("ii", aifc.book.order, aifc.book.npredictors)
         for x in aifc.book.table:
-            ser.add(pack("h", x))
+            book_data += pack("h", x)
+        if book_data in book_to_addr:
+            book_addr_buf.append(pack("P", book_to_addr[book_data]))
+        else:
+            book_to_addr[book_data] = ser.size
+            book_addr_buf.append(pack("P", ser.size))
+            ser.add(book_data)
         ser.align(16)
 
         # Loop
@@ -659,13 +681,6 @@ def serialize_ctl(bank, base_ser, is_shindou):
 
     if drums:
         drum_poses = []
-        # for i in range(len(json["drum_list"])):
-            # empty drums are always at the end
-            # TODO: this might be wrong
-            # if i >= len(drums):
-            #     drum_poses.append(pack("P", 0))
-            #     continue
-            # drum = drums[i]
         for drum in drums:
             drum_poses.append(ser.size)
             ser.add(pack("BBBBX", drum["release_rate"], drum["pan"], 0, 0))
